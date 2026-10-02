@@ -267,6 +267,19 @@ Transactions rolled back by a transient lock failure (`55P03`, `40P01`, `40001`)
   load generator. At 2,000 concurrent connections: 0 5xx, with 2 lock timeouts absorbed by the
   internal retry.
 
+- **Live burst** against https://seat-reservation-86o2.onrender.com (Render free plan: 0.1 CPU,
+  512 MB), with `./burst.sh <url> -concurrency 100`:
+  - 20,000 requests in 3m18s (~100 req/s).
+  - 220 confirmed, 1,070 idempotent replays, 18,330 `seat_taken`, 280 `per_user_limit`,
+    100 `idempotency_conflict`.
+  - **0 5xx.** Every invariant and the DB reconciliation pass. p50 0.9s, p99 2.9s.
+- **A finding from the live run.** The first live run had one 5xx. The app's own metrics showed it
+  had answered 19,999 of 20,000 reserve calls, all with 2xx/4xx, so the 5xx came from Render's
+  proxy. The cause was readiness: it opened a new DB connection per probe, and on 0.1 CPU the auth
+  handshake exceeded its timeout under load. Render briefly treated the instance as unhealthy.
+  Readiness now keeps one warm connection in its own one-connection pool (still separate from the
+  main pool). It still reports DOWN within ~3s of a real outage, and the rerun was clean.
+
 **A finding from burst testing.** The first container burst produced three 503s. Sampling
 `pg_stat_activity` during the run showed Postgres mostly idle while transactions sat
 *idle in transaction* for up to 3.5s, and the JVM was CPU-saturated: lock *holders* were being
