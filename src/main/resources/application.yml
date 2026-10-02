@@ -1,0 +1,68 @@
+server:
+  port: ${PORT:8080}
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: ${TOMCAT_MAX_THREADS:200}
+    accept-count: 2000
+    max-connections: 20000
+
+spring:
+  application:
+    name: seat-reservation
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/seatres}
+    username: ${DB_USER:seatres}
+    password: ${DB_PASSWORD:seatres}
+    hikari:
+      pool-name: seatres-pool
+      maximum-pool-size: ${DB_POOL_SIZE:20}
+      minimum-idle: 2
+      # How long a request may wait for a pooled connection before we shed it with a 503.
+      connection-timeout: ${DB_CONNECTION_TIMEOUT_MS:15000}
+      validation-timeout: 1000
+      # Do not crash the process if the DB is briefly unreachable at boot; Flyway retries below.
+      initialization-fail-timeout: -1
+  flyway:
+    enabled: true
+    connect-retries: 30
+    connect-retries-interval: 2s
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    deserialization:
+      # Unknown fields (e.g. a spoofed "user_id") are ignored, never bound.
+      fail-on-unknown-properties: false
+    default-property-inclusion: non_null
+  mvc:
+    problemdetails:
+      enabled: false
+
+management:
+  endpoints:
+    web:
+      base-path: /
+      exposure:
+        include: prometheus
+      path-mapping:
+        prometheus: metrics
+  endpoint:
+    health:
+      enabled: false
+  metrics:
+    tags:
+      application: seat-reservation
+
+seatres:
+  auth:
+    # HMAC secret for signing/verifying bearer tokens. MUST be overridden outside local dev.
+    secret: ${AUTH_SECRET:local-dev-secret-change-me-0123456789abcdef}
+    # Enables POST /auth/dev-token so reviewers can mint tokens without tooling.
+    dev-token-endpoint: ${AUTH_DEV_TOKEN_ENDPOINT:true}
+  db:
+    lock-timeout-ms: ${DB_LOCK_TIMEOUT_MS:5000}
+    statement-timeout-ms: ${DB_STATEMENT_TIMEOUT_MS:10000}
+  limits:
+    max-seats-per-show: 10000
+    max-seats-per-request: 10
