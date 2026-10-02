@@ -450,6 +450,9 @@ func report(rs []result, showID, admin string, mBefore, mAfter map[string]float6
 		check("METRICS RECONCILE", false, fmt.Sprintf("(could not scrape /metrics: %v)", mErr))
 		return pass
 	}
+	startBefore, startAfter := sumMetric(mBefore, "process_start_time_seconds"), sumMetric(mAfter, "process_start_time_seconds")
+	check("NO SERVER RESTART", startBefore == startAfter,
+		fmt.Sprintf("(process_start_time_seconds %.0f -> %.0f; a restart resets counters and drops in-flight requests)", startBefore, startAfter))
 	delta := func(name string, labels ...string) int {
 		return int(sumMetric(mAfter, name, labels...) - sumMetric(mBefore, name, labels...))
 	}
