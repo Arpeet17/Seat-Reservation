@@ -273,10 +273,25 @@ Transactions rolled back by a transient lock failure (`55P03`, `40P01`, `40001`)
 
 - **Live burst** against https://seat-reservation-86o2.onrender.com (Render free plan: 0.1 CPU,
   512 MB), with `./burst.sh <url> -concurrency 100`:
-  - 20,000 requests in 3m18s (~100 req/s).
-  - 220 confirmed, 1,070 idempotent replays, 18,330 `seat_taken`, 280 `per_user_limit`,
+  - 20,000 requests in 2m50s (~118 req/s).
+  - 220 confirmed, 1,070 idempotent replays, 18,334 `seat_taken`, 276 `per_user_limit`,
     100 `idempotency_conflict`.
-  - **0 5xx.** Every invariant and the DB reconciliation pass. p50 0.9s, p99 2.9s.
+  - **0 5xx and no server restart.** Every invariant and the DB reconciliation pass. p50 0.8s,
+    p99 2.1s, max 5s.
+  - **Metrics reconcile exactly:** every counter's delta across the run equals the outcomes the
+    client observed, and `show_seats{show_id,status}` equals `GET /shows/{id}`.
+- **A finding from tuning for the free tier.** One live run restarted mid-burst: counters went
+  backwards and the proxy returned 46 5xx while the instance was down. I reproduced the free tier
+  locally (`docker run --cpus 0.1 --memory 512m`) to find the cause.
+  - **Memory was not it:** peak 188 MB of 512.
+  - **What it showed:** 200 request threads competing for 15 DB connections. Requests timed out
+    waiting for a connection (43 503s), and health probes slowed down enough for the platform to
+    act on them.
+  - **Fix:** request threads roughly equal to the pool (25 vs 20) and a 30s connection wait. Excess
+    load now queues at the socket instead of failing.
+  - **Result:** the same simulation, then the live run above, gave 0 5xx and no restart. The
+    burst tool now fails a run outright if the server restarted, by comparing
+    `process_start_time_seconds` before and after.
 - **A finding from the live run.** The first live run had one 5xx. The app's own metrics showed it
   had answered 19,999 of 20,000 reserve calls, all with 2xx/4xx, so the 5xx came from Render's
   proxy. The cause was readiness: it opened a new DB connection per probe, and on 0.1 CPU the auth

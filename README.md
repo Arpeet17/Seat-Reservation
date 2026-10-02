@@ -279,17 +279,39 @@ checks the invariants from both the responses and server state and **exits non-z
 after the stampede. It requires each counter delta to equal the outcomes it observed itself
 (`reservations_confirmed_total` = new 201s, `reservations_declined_total{reason=…}` = each 409
 reason and the replays, `reservation_errors_total` = 5xx), and the per-show gauge
-`show_seats{show_id,status}` to equal `GET /shows/{id}`. Last live run:
+`show_seats{show_id,status}` to equal `GET /shows/{id}`. It also fails if the server process
+restarted during the run (`process_start_time_seconds` changed).
+
+**Last live run** (`./burst.sh https://seat-reservation-86o2.onrender.com -concurrency 100`,
+Render free plan):
 
 ```
+Completed 20000 requests in 2m49.672s (118 req/s)
+
+201 confirmed:             220
+201 idempotent_replay:     1070
+409 seat_taken:            18334
+409 per_user_limit:        276
+409 idempotency_conflict:  100
+5xx_total:                 0
+latency p50/p95/p99/max:   792ms / 1.393s / 2.108s / 5.053s
+
+total: 505   available: 252   held: 0   confirmed: 253
+
+INVARIANT / NO DOUBLE SELL / SEATS MATCH RESPONSES / PER USER LIMIT / IDENTITY FROM TOKEN /
+IDEMPOTENCY / 5XX / TRANSPORT / DB RECONCILIATION / NO SERVER RESTART:   all PASS
+
+metric                                                       expected   /metrics
 reservations_confirmed_total            (delta vs 201 new)        220        220  ok
-reservations_declined_total{seat_taken}           (delta)       18329      18329  ok
-reservations_declined_total{per_user_limit}       (delta)         281        281  ok
+reservations_declined_total{seat_taken}           (delta)       18334      18334  ok
+reservations_declined_total{per_user_limit}       (delta)         276        276  ok
 reservations_declined_total{idempotent_replay}    (delta)        1070       1070  ok
 reservations_declined_total{idempotency_conflict} (delta)         100        100  ok
 reservation_errors_total                (delta vs 5xx)              0          0  ok
 show_seats{status=available}     (gauge vs GET /shows)            252        252  ok
+show_seats{status=held}          (gauge vs GET /shows)              0          0  ok
 show_seats{status=confirmed}     (gauge vs GET /shows)            253        253  ok
+METRICS RECONCILE:           PASS
 ```
 
 The match is exact only if nothing else hits the service during the run. Counters are
