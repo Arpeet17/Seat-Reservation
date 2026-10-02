@@ -1,11 +1,16 @@
 package dev.seatres.observability;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 import io.micrometer.core.instrument.Gauge;
 import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.MultiGauge;
+import io.micrometer.core.instrument.Tags;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -57,6 +62,11 @@ public class SeatStateMonitor {
     private final AtomicLong confirmed = new AtomicLong();
     private final AtomicLong mismatches = new AtomicLong();
 
+    /** Per-show gauges are published for the most recently created shows only, bounding cardinality. */
+    static final int PER_SHOW_GAUGE_LIMIT = 50;
+
+    private final MultiGauge showSeats;
+
     public SeatStateMonitor(JdbcTemplate jdbc, MeterRegistry registry) {
         this.jdbc = jdbc;
         Gauge.builder("seats.available", available, AtomicLong::get).description("Seats available, all shows").register(registry);
@@ -64,9 +74,17 @@ public class SeatStateMonitor {
         Gauge.builder("seats.confirmed", confirmed, AtomicLong::get).description("Seats confirmed, all shows").register(registry);
         Gauge.builder("reconciliation.mismatches", mismatches, AtomicLong::get)
                 .description("Rows violating a reconciliation invariant; must always be 0").register(registry);
+        this.showSeats = MultiGauge.builder("show.seats")
+                .description("Seats by status for each of the " + PER_SHOW_GAUGE_LIMIT + " most recent shows")
+                .register(registry);
     }
 
-    @Scheduled(fixedDelayString = "${seatres.monitor.seat-gauge-interval-ms:10000}", initialDelay = 5000)
+    /**
+     * Global and per-show seat gauges, from the seats table. show_seats{show_id, status} matches
+     * GET /shows/{id} for the same show (within one refresh interval), so a burst against a fresh
+     * show can be watched and reconciled directly.
+     */
+    @Scheduled(fixedDelayString = "${seatres.monitor.seat-gauge-interval-ms:2000}", initialDelay = 3000)
     public void refreshSeatGauges() {
         try {
             long a = 0, h = 0, c = 0;
@@ -82,6 +100,21 @@ public class SeatStateMonitor {
             available.set(a);
             held.set(h);
             confirmed.set(c);
+
+            // One row per (recent show, status), including zero counts so every series exists.
+            List<MultiGauge.Row<?>> rows = new ArrayList<>();
+            for (Map<String, Object> row : jdbc.queryForList(
+                    "SELECT r.id::text AS show_id, st.status, "
+                            + "       (SELECT count(*) FROM seats s WHERE s.show_id = r.id AND s.status = st.status) AS n "
+                            + "FROM (SELECT id FROM shows ORDER BY created_at DESC LIMIT ?) r "
+                            + "CROSS JOIN (VALUES ('AVAILABLE'), ('HELD'), ('CONFIRMED')) AS st(status)",
+                    PER_SHOW_GAUGE_LIMIT)) {
+                rows.add(MultiGauge.Row.of(
+                        Tags.of("show_id", (String) row.get("show_id"),
+                                "status", ((String) row.get("status")).toLowerCase(Locale.ROOT)),
+                        ((Number) row.get("n")).longValue()));
+            }
+            showSeats.register(rows, true);   // overwrite: shows that fall out of the window are removed
         } catch (Exception e) {
             log.warn("seat gauge refresh failed: {}", e.getMessage());
         }

@@ -310,6 +310,26 @@ class ConcurrencyIT extends IntegrationTestBase {
                 .isNotNull().satisfies(c -> assertThat(c.count()).isPositive());
     }
 
+    // ------------------------------------------------------------------ metrics reconcile with API state
+    @org.springframework.beans.factory.annotation.Autowired
+    dev.seatres.observability.SeatStateMonitor seatMonitor;
+
+    @Test
+    void perShowSeatGaugeMatchesShowState() {
+        String show = createShow(seatRange("M", 5), null);
+        List<String> tokens = IntStream.range(0, 20).mapToObj(i -> token(uniqueUser("g"))).toList();
+        concurrently(20, i -> () -> reserve(tokens.get(i), show, List.of("M" + (1 + i % 5)), "k"));
+
+        seatMonitor.refreshSeatGauges();
+        var state = call("GET", "/shows/" + show, null, null).body();
+        for (String status : List.of("available", "held", "confirmed")) {
+            var gauge = meters.find("show.seats").tags("show_id", show, "status", status).gauge();
+            assertThat(gauge).as("show_seats{status=%s}", status).isNotNull();
+            assertThat((long) gauge.value()).as("show_seats{status=%s} vs API", status).isEqualTo(state.get(status).asLong());
+        }
+        assertThat(state.get("confirmed").asInt()).isEqualTo(5);
+    }
+
     // ------------------------------------------------------------------ logs access
     @Test
     void recentLogsAreQueryableByRequestId() throws Exception {
