@@ -16,6 +16,9 @@ import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RestController;
 
 import dev.seatres.auth.Principal;
+import dev.seatres.error.ApiException;
+import dev.seatres.error.GlobalExceptionHandler;
+import dev.seatres.observability.ReservationMetrics;
 import dev.seatres.reservation.ReservationService.ReserveResult;
 import dev.seatres.web.RequestContext;
 
@@ -33,16 +36,40 @@ public class ReservationController {
     }
 
     private final ReservationService reservations;
+    private final ReservationMetrics metrics;
 
-    public ReservationController(ReservationService reservations) {
+    public ReservationController(ReservationService reservations, ReservationMetrics metrics) {
         this.reservations = reservations;
+        this.metrics = metrics;
     }
 
     @PostMapping("/shows/{showId}/reserve")
     public ResponseEntity<ReservationView> reserve(Principal principal, @PathVariable UUID showId,
                                                    @Valid @RequestBody ReserveRequest req) {
         RequestContext.showId(showId);
-        ReserveResult result = reservations.reserve(principal, showId, req.seats(), req.idempotencyKey());
+        metrics.request();
+        long start = System.nanoTime();
+        String outcome = "error";
+        ReserveResult result;
+        try {
+            result = reservations.reserve(principal, showId, req.seats(), req.idempotencyKey());
+            if (result.replayed()) {
+                metrics.replayed();
+                outcome = "replayed";
+            } else {
+                metrics.confirmed();
+                outcome = "confirmed";
+            }
+        } catch (ApiException e) {
+            metrics.failed(e.code());
+            outcome = e.code().status().is4xxClientError() ? "declined" : "error";
+            throw e;
+        } catch (RuntimeException e) {
+            metrics.error(GlobalExceptionHandler.classify(e).name().toLowerCase());
+            throw e;
+        } finally {
+            metrics.latency(outcome, System.nanoTime() - start);
+        }
         RequestContext.reservationId(result.reservation().reservationId());
         var builder = ResponseEntity.status(result.status());
         if (result.replayed()) {
@@ -54,7 +81,9 @@ public class ReservationController {
     @PostMapping("/reservations/{reservationId}/cancel")
     public ReservationView cancel(Principal principal, @PathVariable UUID reservationId) {
         RequestContext.reservationId(reservationId);
-        return reservations.cancel(principal, reservationId);
+        ReservationView view = reservations.cancel(principal, reservationId);
+        metrics.cancelled();
+        return view;
     }
 
     @GetMapping("/reservations/{reservationId}")

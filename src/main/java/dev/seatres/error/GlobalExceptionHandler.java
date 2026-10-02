@@ -20,10 +20,17 @@ import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.servlet.resource.NoResourceFoundException;
 
+import dev.seatres.observability.ReservationMetrics;
 import dev.seatres.web.RequestContext;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
+
+    private final ReservationMetrics metrics;
+
+    public GlobalExceptionHandler(ReservationMetrics metrics) {
+        this.metrics = metrics;
+    }
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
@@ -62,6 +69,7 @@ public class GlobalExceptionHandler {
     @ExceptionHandler(Exception.class)
     public ResponseEntity<ErrorResponse> handleUnexpected(Exception e, HttpServletRequest req) {
         ErrorCode code = classify(e);
+        metrics.dbFailure(e);
         if (code == ErrorCode.INTERNAL_ERROR) {
             log.error("unexpected error", e);
         } else {
