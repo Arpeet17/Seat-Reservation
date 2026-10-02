@@ -60,7 +60,12 @@ class UnitTests {
         props.setUrl("jdbc:postgresql://127.0.0.1:1/nothing");
         props.setUsername("u");
         props.setPassword("p");
-        assertThat(new HealthController(props).ready().getStatusCode().value()).isEqualTo(503);
-        assertThat(new HealthController(props).live()).containsEntry("status", "UP");
+        HealthController health = new HealthController(props);
+        try {
+            assertThat(health.ready().getStatusCode().value()).isEqualTo(503);
+            assertThat(health.live()).containsEntry("status", "UP");
+        } finally {
+            health.destroy();
+        }
     }
 }
