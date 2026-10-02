@@ -234,6 +234,10 @@ Transactions rolled back by a transient lock failure (`55P03`, `40P01`, `40001`)
   - Latency: `reservation_latency_seconds{outcome}` histogram.
 - **DB health:** `db_transaction_failures_total{type}` (deadlock, lock_timeout, …),
   `db_transaction_retries_total{type}`, `hikaricp_connections_pending`.
+- **Per-show gauge:** `show_seats{show_id,status}` (50 most recent shows, refreshed every 2s)
+  equals `GET /shows/{id}`. The burst tool scrapes `/metrics` before and after a run and requires
+  every counter delta to equal the outcomes it observed and the gauge to equal the API state
+  (`METRICS RECONCILE`).
 - **Truth from the database:** `seats_{available,held,confirmed}` and `reconciliation_mismatches`
   are computed from the tables (seven single-statement invariant checks every 30s), never from
   in-process counters, so they cannot drift across instances or restarts.

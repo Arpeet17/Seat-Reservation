@@ -15,9 +15,9 @@ Design rationale and race analysis: **[WRITEUP.md](WRITEUP.md)**.
 |---|---|
 | **Live service** | https://seat-reservation-86o2.onrender.com |
 | **Try it in 5 minutes** | [End-to-end walkthrough](#15-end-to-end-walkthrough-live): every endpoint in order, with real responses |
-| **One-command burst** | `./burst.sh https://seat-reservation-86o2.onrender.com` (details in [section 13](#13-burst-testing)) |
-| **Metrics** | `GET /metrics` (Prometheus text, public) |
-| **Logs** | `GET /admin/logs?request_id=…` with an admin token (see [Metrics & logs access](#metrics--logs-access)) |
+| **One-command burst** | `make burst` or `./burst.sh https://seat-reservation-86o2.onrender.com` (details in [section 13](#13-burst-testing)) |
+| **Metrics** | `GET /metrics` (Prometheus text, public). The burst verifies they reconcile with the API and with its own observations. |
+| **Logs** | `GET /admin/logs?request_id=…`, publicly readable with a demo admin token (see [Metrics & logs access](#metrics--logs-access)) |
 | **Health** | `GET /health/live`, `GET /health/ready` |
 
 ---
@@ -204,7 +204,8 @@ payment → mark cancelled. Non-owners get 404. Re-cancelling returns 200 with t
 | `reservation_errors_total{type}` | counter | 5xx on the reserve path |
 | `reservation_latency_seconds{outcome}` | histogram | `confirmed`/`replayed`/`declined`/`error` |
 | `reservations_cancelled_total` | counter | |
-| `seats_available` / `seats_held` / `seats_confirmed` | gauge | from `seats` table, every 10s |
+| `seats_available` / `seats_held` / `seats_confirmed` | gauge | all shows, from the `seats` table, refreshed every 2s |
+| `show_seats{show_id,status}` | gauge | per show (50 most recent shows), refreshed every 2s; equals `GET /shows/{id}` counts |
 | `reconciliation_mismatches` | gauge | sum of invariant-check violations, every 30s; **must be 0** |
 | `db_transaction_failures_total{type}` | counter | `deadlock`, `lock_timeout`, `serialization`, `statement_timeout`, `connection`, `pool_timeout` |
 | `db_transaction_retries_total{type}` | counter | transactions retried after a transient lock failure (rolled back, safe to rerun) |
@@ -231,7 +232,10 @@ Health and metrics probes are logged only on failure.
 
 ### Metrics & logs access
 
-Reviewers don't need platform access; everything is reachable over HTTP on the live URL.
+Reviewers don't need platform access; everything is reachable over HTTP on the live URL. **Logs are
+publicly accessible:** anyone can mint an admin token from the demo token endpoint (first command
+below) and read `/admin/logs`. Every log line is JSON and carries the `request_id` that is also
+returned in the `X-Request-Id` header and in every error body.
 
 ```bash
 B=https://seat-reservation-86o2.onrender.com
@@ -257,6 +261,7 @@ The full log stream also goes to stdout as JSON, where the platform collects it 
 ## 13. Burst testing
 
 ```bash
+make burst                                              # = ./burst.sh <live URL>
 ./burst.sh http://localhost:8080                        # uses local Go, else the golang image
 ./burst.sh https://seat-reservation-86o2.onrender.com -concurrency 200
 docker compose --profile burst run --rm burst           # inside the compose network
@@ -268,9 +273,30 @@ identical idempotent requests, 10 groups reusing one key with two bodies, 40 use
 requests (limit test), and 1,000 overlapping multi-seat requests in random seat order. It then
 checks the invariants from both the responses and server state and **exits non-zero on any failure**:
 `INVARIANT`, `NO DOUBLE SELL`, `SEATS MATCH RESPONSES`, `PER USER LIMIT`, `IDENTITY FROM TOKEN`,
-`IDEMPOTENCY`, `5XX`, `TRANSPORT`, `DB RECONCILIATION`.
+`IDEMPOTENCY`, `5XX`, `TRANSPORT`, `DB RECONCILIATION`, `METRICS RECONCILE`.
 
-Flags: `-requests`, `-concurrency`, `-hot-seats`, `-hot-users`, `-limit`, `-seed`, `-secret`
+**Metrics reconcile with what the client saw.** The tool scrapes `/metrics` just before and just
+after the stampede. It requires each counter delta to equal the outcomes it observed itself
+(`reservations_confirmed_total` = new 201s, `reservations_declined_total{reason=…}` = each 409
+reason and the replays, `reservation_errors_total` = 5xx), and the per-show gauge
+`show_seats{show_id,status}` to equal `GET /shows/{id}`. Last live run:
+
+```
+reservations_confirmed_total            (delta vs 201 new)        220        220  ok
+reservations_declined_total{seat_taken}           (delta)       18329      18329  ok
+reservations_declined_total{per_user_limit}       (delta)         281        281  ok
+reservations_declined_total{idempotent_replay}    (delta)        1070       1070  ok
+reservations_declined_total{idempotency_conflict} (delta)         100        100  ok
+reservation_errors_total                (delta vs 5xx)              0          0  ok
+show_seats{status=available}     (gauge vs GET /shows)            252        252  ok
+show_seats{status=confirmed}     (gauge vs GET /shows)            253        253  ok
+```
+
+The match is exact only if nothing else hits the service during the run. Counters are
+per-process and reset when the instance restarts, which is standard Prometheus behaviour, so
+reconcile by *delta* across a run, not by absolute value.
+
+Flags: `-requests`, `-concurrency`, `-hot-seats`, `-hot-users`, `-limit`, `-seed`, `-gauge-wait`, `-secret`
 (mint tokens locally instead of calling `/auth/dev-token`).
 
 ## 14. Deployment (Render)
