@@ -134,12 +134,47 @@ Why ten or more concurrent requests from one user cannot exceed the limit:
   and 16×409, in both the test and the burst. The reconciliation check `quota_vs_reservations`
   recomputes the counter from `reservations` and must be 0.
 
-## Holds and cancellation
+## Holds & expiry
+
+**What ships today: no holds, so nothing can expire or be stranded.** Payment is modelled as an
+internal record written in the same transaction as the reservation, so a reserve goes straight to
+`CONFIRMED` atomically. There is no window in which a seat is taken but unpaid, and no timer whose
+failure could strand a seat. `HELD` exists in the `seats.status` check constraint, and `held` is
+reported and reconciled, but nothing writes it, so `held = 0`.
+
+**How holds with expiry would work** once payment goes to an external provider. This is the
+design, not shipped code:
+
+- **Schema:**
+  - `seats.hold_expires_at timestamptz`.
+  - `reservations.status` gains `HELD` and `EXPIRED`.
+  - `CHECK ((status = 'HELD') = (hold_expires_at IS NOT NULL))`.
+- **Reserve:** the same transaction as today, but it writes `HELD` with
+  `hold_expires_at = now() + interval '10 minutes'`. Only the database clock is ever used, never
+  an application clock.
+- **Expiry is enforced lazily, inside the lock, without depending on a timer.** In step B2 the
+  "is free" test on the locked row becomes
+  `status = 'AVAILABLE' OR (status = 'HELD' AND hold_expires_at < now())`. A reserver that finds an
+  expired hold takes it over in the same transaction: it marks the old reservation `EXPIRED` and
+  decrements that owner's quota. Quota rows are then locked in `(show_id, user_id)` order after
+  the seats, so the global lock order still holds. Correctness therefore never depends on a
+  sweeper having run.
+- **Sweeper (housekeeping only):** every few seconds, release expired holds in batches with
+  `SELECT … WHERE status = 'HELD' AND hold_expires_at < now() ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 500`.
+  `SKIP LOCKED` is fine here because the sweeper makes no decision a user depends on; it just
+  keeps the `available` counts and gauges fresh.
+- **Confirm (payment webhook):** lock the reservation and require `HELD` and not expired, then
+  set `CONFIRMED` and clear `hold_expires_at`.
+  - Confirm racing expiry is decided by the row lock: whichever commits first wins.
+  - A payment that lands after expiry is refunded through the provider using the same
+    idempotency key (`reservation_id`), so it can never become a double charge.
+- **New alerts:** a growing backlog of expired-but-unreleased holds (sweeper stuck), and the
+  `held` count rising faster than the confirm rate (payment provider degraded).
+
+## Cancellation
 
 - **Reservation lifecycle:** `CONFIRMED → CANCELLED`. Cancelled is terminal.
 - **Seat lifecycle:** `AVAILABLE → CONFIRMED → AVAILABLE`.
-- `HELD` is in the schema for the hold-then-pay flow above but is never written today, so
-  `held = 0`.
 
 Cancel runs in one transaction:
 1. `SELECT … FROM reservations WHERE id=? FOR UPDATE`. A non-owner gets **404**, so reservation
@@ -151,7 +186,8 @@ Cancel runs in one transaction:
 4. Deactivate the `reservation_seats` rows, decrement the quota, refund the payment, mark the
    reservation cancelled.
 
-Repeat cancels return 200 with the cancelled state.
+Repeat cancels return 200 with the cancelled state. They are answered from a lock-free read,
+because `CANCELLED` is terminal, so duplicates never queue on the row lock.
 
 **Cancel racing reserve:** both need the seat lock. If the cancel commits first, the reserver
 (after its lock wait) re-reads the row, sees `AVAILABLE`, and wins. If the reserver locks first, it
@@ -175,6 +211,16 @@ from the app:
   `COMMIT` is reported as `OUTCOME_UNKNOWN`; the retry is resolved by the idempotency key.
 - Verified by stopping the Postgres container under the running app: readiness 503, reserve 503
   `DB_UNAVAILABLE`, automatic recovery when Postgres returned.
+
+**Under a partition specifically:**
+- **App instances cut off from the database** cannot sell anything; they return 503 and fail
+  readiness. There is no local cache or queue of "pending" reservations that could later conflict.
+- **Instances on the database side** keep selling normally. Since all decisions happen inside the
+  one primary, the two sides can never disagree about a seat.
+- **There is no split brain to resolve,** because there is exactly one writable primary.
+- **With managed failover** (synchronous replica promoted by the provider), the cost is a short
+  write outage during promotion, not divergence. The trade-off is explicit: availability is given
+  up during the partition or failover, and correctness never is.
 
 Every lock wait and statement is bounded (`lock_timeout` 5s, `statement_timeout` 10s).
 Transactions rolled back by a transient lock failure (`55P03`, `40P01`, `40001`) are retried up to
@@ -209,12 +255,12 @@ Transactions rolled back by a transient lock failure (`55P03`, `40P01`, `40001`)
 
 ## Evidence
 
-- **Test suite** (`mvn test`): 20 tests against real Postgres over real HTTP, every one followed
+- **Test suite** (`mvn test`): 21 tests against real Postgres over real HTTP, every one followed
   by the reconciliation checks. Coverage: a 500-way single seat, 100× the same key, same key with
   different bodies (sequential and concurrent), per-user storms, all-or-nothing multi-seat,
   shuffled overlapping multi-seat (deadlock freedom), cancel vs reserve, concurrent cancels,
   non-owner cancel, identity spoofing, forged tokens, a lock held past `lock_timeout` (must be 201,
-  not 503), and readiness with the DB down.
+  not 503), log retrieval by request id, and readiness with the DB down.
 - **Burst** (`docker compose --profile burst run --rm burst`, 20,000 requests, 500 concurrent,
   ~17,400 on 5 hot seats): every invariant passes with **0 5xx**. Warm runs take 11–22s
   (~900–1,750 req/s, p99 0.6–2.4s) on a laptop sharing 8 vCPUs between the app, Postgres and the
@@ -236,35 +282,68 @@ working.
 
 ## AI usage
 
-This project was built with an AI coding assistant (Claude) working in my repository. In detail:
+I built this with an AI coding assistant (Claude, running in my repository) and used it heavily.
+The split below is what actually happened.
 
-**AI-assisted**
-- Wrote the first architecture and concurrency proposal (schema, lock order, idempotency race
-  analysis, isolation-level reasoning), which I reviewed before any code was written.
-- Wrote most of the implementation code, Flyway migrations, the Testcontainers concurrency suite,
-  the Go burst tool, Docker/Compose/Render configuration, the README and this write-up.
-- Debugging: diagnosed the burst-time 503s (thread dumps, `pg_stat_activity` sampling, per-container
-  CPU) and proposed the pre-check consolidation and bounded retry.
-- Weighed alternatives (`SKIP LOCKED` vs blocking locks, counter row vs advisory lock vs
-  `SERIALIZABLE`, JDBC vs JPA, storing failed idempotent outcomes).
+**What I directed the AI to do**
+- Turn my requirements brief (stack, invariants, error model, test cases, burst script, docs) into
+  a design proposal *before* any code: schema, lock order, idempotency race analysis, isolation
+  level. I reviewed that proposal and answered its open questions before implementation started.
+- Write the implementation, Flyway migrations, the Testcontainers concurrency suite, the Go burst
+  tool, the Docker/Compose/Render configuration, and drafts of the README and this write-up.
+- Commit in logical, incremental steps. The history shows the real order of work, including the
+  fixes that came out of burst testing.
+- Debug the 503s the first container burst produced. It sampled `pg_stat_activity`, took thread
+  dumps and measured per-container CPU, which showed lock holders being starved of CPU mid-transaction.
 
-**Engineering decisions I made or approved after review**
-- Correctness over throughput; PostgreSQL as the only source of truth; no Redis or Kafka.
-- Concurrency mechanism: ordered `FOR UPDATE` plus atomic conditional statements at
-  `READ COMMITTED`, rather than optimistic locking or `SERIALIZABLE`.
-- Transaction boundaries: idempotency claim first, a single transaction per reservation, and
-  failed attempts not persisted.
-- API semantics: all-or-nothing multi-seat, order-insensitive request hashing, 404 for non-owners,
-  replay returning the original response.
-- Signed bearer tokens instead of a trusted `user_id`; plain JDBC instead of JPA on the
-  critical path; Render as the deployment target.
+**What I decided**
+- **Scope and constraints:** correctness over throughput; PostgreSQL as the single source of truth;
+  no Redis, Kafka or distributed locks; money in integer paise.
+- **Choices from the AI's options:**
+  - HMAC-signed bearer tokens instead of a plain `Bearer user-123`.
+  - 404 rather than 403 for someone else's reservation.
+  - Storing only successful outcomes under an idempotency key.
+  - Plain JDBC instead of JPA on the reservation path.
+  - Render as the deployment target.
+  - Keeping Java/Spring rather than switching stacks.
+- **Accepted after review:** ordered `SELECT … FOR UPDATE` with atomic conditional statements at
+  `READ COMMITTED` (over optimistic locking or `SERIALIZABLE`); the idempotency claim as the first
+  statement of the transaction; a counter row for the per-user limit; all-or-nothing multi-seat;
+  order-insensitive request hashing.
+- **What the write-up must cover,** and that this AI-usage section stays honest.
 
-## Known limitations and next steps
+**How I checked it.** I didn't take the AI's word that the code was correct. The claims in this
+document are backed by tests that run against real PostgreSQL over real HTTP, and by the burst
+tool, which checks every invariant against server state and exits non-zero on failure. I can walk
+through, and extend, any part of the locking and idempotency logic.
 
-- Single primary database. A read replica could serve `GET /shows`; writes must stay on the
-  primary.
-- Holds with TTL and a real payment provider are designed (above) but not implemented.
-- Idempotency keys never expire. Production would apply a TTL (e.g. 24h) and a cleanup job.
-- Failed attempts are not stored under their idempotency key. A stricter variant would persist the
-  409 via a savepoint so that retries return the identical failure.
-- The dev token endpoint exists for the demo only and must be disabled in real deployments.
+## What I'd do next
+
+In priority order:
+
+1. **Holds with expiry and a real payment provider**, exactly as designed above: lazy expiry in
+   the lock, a `SKIP LOCKED` sweeper, and the provider idempotency key = `reservation_id`.
+2. **Run Stage B in one round trip** (a PL/pgSQL function). Then lock hold time depends only on
+   the database, not on application CPU scheduling. That was the root cause of the only 503s the
+   burst ever produced.
+3. **Load shedding before the database:** cap in-flight reservation requests per instance and
+   return a fast 503 with `Retry-After` when full, instead of letting requests queue for seconds
+   on the pool.
+4. **A TTL on idempotency keys** (e.g. 24h) with a cleanup job, and optionally persist failed
+   outcomes via a savepoint so retries get the identical 409.
+5. **Real identity:** replace the dev-token endpoint with OIDC/JWKS verification from an identity
+   provider, and add per-user rate limiting.
+6. **Scale reads:** serve `GET /shows/{id}` from a read replica or a short cache. Writes stay on
+   the primary.
+7. **Tracing** (OpenTelemetry) spanning HTTP → transaction → each SQL statement, to make lock
+   waits visible per request.
+
+## Known limitations
+
+- Single primary database; see "Consistency vs availability".
+- Holds and expiry are designed but not implemented; `held` is always 0.
+- Payments are logical records; no gateway is called.
+- `/admin/logs` holds the last 2,000 lines per instance in memory. It is a convenience view, not
+  a log store.
+- The dev token endpoint mints any identity, including admin. It is demo-only and must be
+  disabled in real deployments.

@@ -11,6 +11,14 @@ enforced by row locks, atomic conditional statements and constraints inside one 
 
 Design rationale and race analysis: **[WRITEUP.md](WRITEUP.md)**.
 
+| | |
+|---|---|
+| **Live service** | `https://<your-service>.onrender.com` *(fill in after deploy)* |
+| **One-command burst** | `./burst.sh https://<your-service>.onrender.com` (details in [section 13](#13-burst-testing)) |
+| **Metrics** | `GET /metrics` (Prometheus text, public) |
+| **Logs** | `GET /admin/logs?request_id=…` with an admin token (see [Metrics & logs access](#metrics--logs-access)) |
+| **Health** | `GET /health/live`, `GET /health/ready` |
+
 ---
 
 ## 1. Architecture
@@ -108,6 +116,7 @@ All bodies are JSON with `snake_case` fields. Every response carries `X-Request-
 | `GET` | `/reservations/{id}` | owner | 200 | 401, 404 |
 | `POST` | `/reservations/{id}/cancel` | owner | 200 (idempotent) | 401, 404 |
 | `GET` | `/admin/reconciliation` | admin | 200 `{ok, checks}` | 401, 403 |
+| `GET` | `/admin/logs` | admin | 200 NDJSON of recent log lines (`request_id`, `level`, `q`, `limit` filters) | 401, 403 |
 | `GET` | `/health/live` | – | 200 | – |
 | `GET` | `/health/ready` | – | 200 / 503 when Postgres is unreachable | – |
 | `GET` | `/metrics` | – | Prometheus text | – |
@@ -218,6 +227,31 @@ JSON, one object per line, to stdout. Each request produces one `access` line:
 `request_id` honours a well-formed inbound `X-Request-Id`, otherwise a UUID is generated, and it is
 echoed in the response header and error body. Headers are never logged, so tokens cannot leak.
 Health and metrics probes are logged only on failure.
+
+### Metrics & logs access
+
+Reviewers don't need platform access; everything is reachable over HTTP on the live URL.
+
+```bash
+B=https://<your-service>.onrender.com
+ADMIN=$(curl -s -XPOST $B/auth/dev-token -H 'content-type: application/json' \
+  -d '{"user_id":"reviewer","role":"admin"}' | jq -r .token)
+
+# Metrics (public): reservation outcomes, latency histogram, seat gauges, reconciliation
+curl -s $B/metrics | grep -E '^(reservations_|reservation_|seats_|reconciliation_|db_transaction_)'
+
+# Recent structured logs from this instance (NDJSON, newest last, last 2000 lines kept)
+curl -s "$B/admin/logs?limit=50" -H "authorization: Bearer $ADMIN"
+curl -s "$B/admin/logs?request_id=<id from any response's X-Request-Id or error body>" -H "authorization: Bearer $ADMIN"
+curl -s "$B/admin/logs?level=WARN" -H "authorization: Bearer $ADMIN"
+curl -s "$B/admin/logs?q=SEAT_UNAVAILABLE&limit=20" -H "authorization: Bearer $ADMIN"
+
+# On-demand invariant checks against the database
+curl -s $B/admin/reconciliation -H "authorization: Bearer $ADMIN"
+```
+
+The full log stream also goes to stdout as JSON, where the platform collects it (Render → service
+→ Logs).
 
 ## 13. Burst testing
 
