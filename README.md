@@ -14,6 +14,7 @@ Design rationale and race analysis: **[WRITEUP.md](WRITEUP.md)**.
 | | |
 |---|---|
 | **Live service** | https://seat-reservation-86o2.onrender.com |
+| **Try it in 5 minutes** | [End-to-end walkthrough](#15-end-to-end-walkthrough-live): every endpoint in order, with real responses |
 | **One-command burst** | `./burst.sh https://seat-reservation-86o2.onrender.com` (details in [section 13](#13-burst-testing)) |
 | **Metrics** | `GET /metrics` (Prometheus text, public) |
 | **Logs** | `GET /admin/logs?request_id=…` with an admin token (see [Metrics & logs access](#metrics--logs-access)) |
@@ -284,28 +285,189 @@ Any Docker host works the same way: set `DATABASE_URL` (or `DB_URL`/`DB_USER`/`D
 `AUTH_SECRET`. Free-tier instances sleep when idle; the burst tool waits up to 3 minutes for
 `/health/ready` before starting.
 
-## 15. Example curl session
+## 15. End-to-end walkthrough (live)
+
+A complete tour of the API against the live deployment, in order. Every response below is real
+output from the live service, trimmed for length. Each step gives the method, URL, headers and
+body, so it works in curl or in any API client (Postman, Insomnia, Thunder Client). A
+copy-paste script for the whole sequence is at the end of this section.
+
+**Base URL:** `https://seat-reservation-86o2.onrender.com` (locally: `http://localhost:8080`)
+
+> The service runs on Render's free tier. If it has been idle, the first request can take up to
+> a minute while it wakes.
+
+### Phase 1: Setup
+
+**Step 1. Check the service is up**
+```
+GET https://seat-reservation-86o2.onrender.com/health/ready
+```
+```json
+{"database":"UP","status":"UP"}
+```
+
+**Step 2. Get an admin token**
+```
+POST https://seat-reservation-86o2.onrender.com/auth/dev-token
+Content-Type: application/json
+
+{"user_id":"admin","role":"admin"}
+```
+```json
+{"expires_in":86400,"user_id":"admin","role":"admin","token":"eyJhbGciOiJIUzI1NiIs..."}
+```
+Save `token` as **ADMIN_TOKEN**. Tokens are valid for 24 hours.
+
+**Step 3. Get tokens for two users.** Same endpoint, two calls:
+```
+POST https://seat-reservation-86o2.onrender.com/auth/dev-token
+{"user_id":"alice"}        → ALICE_TOKEN
+
+POST https://seat-reservation-86o2.onrender.com/auth/dev-token
+{"user_id":"bob"}          → BOB_TOKEN
+```
+
+**Step 4. Create a show (admin only)**
+```
+POST https://seat-reservation-86o2.onrender.com/shows
+Content-Type: application/json
+Authorization: Bearer ADMIN_TOKEN
+
+{"name":"friday-night","seats":["A1","A2","A3","A4","A5","A6"],"price_paise":25000,"per_user_limit":4}
+```
+**201 Created**
+```json
+{"show_id":"de286b78-10aa-4b80-a17c-938d3278c815","name":"friday-night","price_paise":25000,
+ "per_user_limit":4,"total_seats":6,"available":6,"held":0,"confirmed":0,
+ "seats":[{"label":"A1","status":"available"}, ...]}
+```
+Save `show_id` as **SHOW_ID**.
+
+### Phase 2: Booking scenarios
+
+Every row below is
+`POST https://seat-reservation-86o2.onrender.com/shows/SHOW_ID/reserve` with headers
+`Content-Type: application/json` and `Authorization: Bearer <token>`.
+
+| Step | Token | Body | Response | What it proves |
+|---|---|---|---|---|
+| **5** | ALICE | `{"seats":["A1","A2"],"idempotency_key":"alice-order-1"}` | **201** `{"reservation_id":"b0ad4611-…","user_id":"alice","seats":["A1","A2"],"amount_paise":50000,"status":"confirmed"}` | Booking works; the amount is 2 × 25000 paise. Save `reservation_id` as **RESERVATION_ID**. |
+| **6** | ALICE | `{"seats":["A2","A1"],"idempotency_key":"alice-order-1"}` | **201**, header `Idempotent-Replayed: true`, **same** `reservation_id` | A retry never books or charges twice. Seat order doesn't matter. |
+| **7** | ALICE | `{"seats":["A3"],"idempotency_key":"alice-order-1"}` | **409** `IDEMPOTENCY_KEY_REUSED` | Reusing a key with a different request is rejected |
+| **8** | BOB | `{"seats":["A1"],"idempotency_key":"bob-order-1"}` | **409** `SEAT_UNAVAILABLE` | A seat is never sold twice |
+| **9** | BOB | `{"seats":["A3","A1"],"idempotency_key":"bob-order-2"}` | **409** `SEAT_UNAVAILABLE`, and A3 stays `available` | All-or-nothing: no partial booking |
+| **10** | ALICE | `{"seats":["A3","A4","A5"],"idempotency_key":"alice-order-2"}` | **409** `PER_USER_LIMIT_EXCEEDED` | Alice holds 2 seats; 2 + 3 exceeds the limit of 4 |
+
+**Identity can't be spoofed.** Add `"user_id":"bob"` to Alice's request body and the reservation
+still belongs to `alice`: identity comes only from the signed token, and body fields claiming
+identity are ignored.
+
+### Phase 3: Inspect state
+
+**Step 11. Show state** (public, also opens in a browser)
+```
+GET https://seat-reservation-86o2.onrender.com/shows/SHOW_ID
+```
+```json
+{"total_seats":6,"available":4,"held":0,"confirmed":2,
+ "seats":[{"label":"A1","status":"confirmed"},{"label":"A2","status":"confirmed"},
+          {"label":"A3","status":"available"}, ...]}
+```
+`available + held + confirmed == total_seats` (4 + 0 + 2 = 6), always.
+
+**Step 12. View a reservation** (owner only)
+```
+GET https://seat-reservation-86o2.onrender.com/reservations/RESERVATION_ID
+Authorization: Bearer ALICE_TOKEN
+```
+**200**: Alice's reservation with `"status":"confirmed"`.
+
+### Phase 4: Cancellation
+
+| Step | Request | Response | What it proves |
+|---|---|---|---|
+| **13** | `POST https://seat-reservation-86o2.onrender.com/reservations/RESERVATION_ID/cancel` with **BOB_TOKEN** | **404** `RESERVATION_NOT_FOUND` | Only the owner can cancel. Other users can't even confirm that the reservation exists. |
+| **14** | Same URL with **ALICE_TOKEN** | **200** `"status":"cancelled","cancelled_at":"…"` | The owner can cancel. A1 and A2 are released and Alice's quota is freed. Repeat calls return 200 again. |
+| **15** | `POST …/shows/SHOW_ID/reserve`, BOB_TOKEN, `{"seats":["A1"],"idempotency_key":"bob-order-3"}` | **201** `"user_id":"bob","seats":["A1"]` | Released seats can be sold again |
+
+### Phase 5: Security
+
+**Step 16. A request without a token**
+```
+POST https://seat-reservation-86o2.onrender.com/shows/SHOW_ID/reserve
+Content-Type: application/json
+
+{"seats":["A4"],"idempotency_key":"x"}
+```
+**401** `{"code":"UNAUTHENTICATED","message":"missing or invalid bearer token"}`. A forged or
+expired token also gets 401. A non-admin token on `POST /shows` gets **403**.
+
+### Phase 6: Observability
+
+| Step | Request | What you see |
+|---|---|---|
+| **17** | `GET https://seat-reservation-86o2.onrender.com/metrics` (public, opens in a browser) | Prometheus metrics: `reservations_confirmed_total`, `reservations_declined_total{reason="seat_taken"}`, `seats_available`, `reconciliation_mismatches`, latency histograms |
+| **18** | `GET https://seat-reservation-86o2.onrender.com/admin/logs?limit=20` with `Authorization: Bearer ADMIN_TOKEN` | Recent JSON log lines. Filter with `?request_id=<id from any response>`, `?level=WARN` or `?q=SEAT_UNAVAILABLE`. |
+| **19** | `GET https://seat-reservation-86o2.onrender.com/admin/reconciliation` with `Authorization: Bearer ADMIN_TOKEN` | `{"ok":true,"checks":{…}}`: seven integrity checks run directly against the database, each of which must be 0 |
+
+Every response, including errors, carries an `X-Request-Id` header. Error bodies repeat it as
+`request_id`, so any failure can be traced in the logs (step 18).
+
+### Phase 7: Concurrency at scale (one command)
 
 ```bash
-B=http://localhost:8080
-ADMIN=$(curl -s -XPOST $B/auth/dev-token -H 'content-type: application/json' -d '{"user_id":"admin","role":"admin"}' | jq -r .token)
-ALICE=$(curl -s -XPOST $B/auth/dev-token -H 'content-type: application/json' -d '{"user_id":"alice"}' | jq -r .token)
+./burst.sh https://seat-reservation-86o2.onrender.com -concurrency 100
+```
+This fires 20,000 concurrent requests (a hot-seat storm, duplicate idempotency keys, per-user
+floods, overlapping multi-seat requests) and ends with PASS/FAIL for every invariant. The last
+live run passed every check with zero 5xx responses. See [section 13](#13-burst-testing).
+
+### The whole walkthrough as one script
+
+Run this in Git Bash, macOS or Linux. It needs only `curl`.
+
+```bash
+B=https://seat-reservation-86o2.onrender.com      # or http://localhost:8080
+R=$RANDOM                                         # unique user names per run (see note below)
+tok() { curl -s -XPOST $B/auth/dev-token -H 'content-type: application/json' \
+        -d "{\"user_id\":\"$1\",\"role\":\"${2:-user}\"}" | sed 's/.*"token":"\([^"]*\)".*/\1/'; }
+
+curl -s $B/health/ready; echo                                                   # 1
+ADMIN=$(tok admin admin); ALICE=$(tok alice$R); BOB=$(tok bob$R)                # 2-3
 
 SHOW=$(curl -s -XPOST $B/shows -H "authorization: Bearer $ADMIN" -H 'content-type: application/json' \
-  -d '{"name":"friday-night","seats":["A1","A2","A3"],"price_paise":25000}' | jq -r .show_id)
+  -d '{"name":"friday-night","seats":["A1","A2","A3","A4","A5","A6"],"price_paise":25000,"per_user_limit":4}' \
+  | sed 's/.*"show_id":"\([^"]*\)".*/\1/'); echo "SHOW=$SHOW"                   # 4
 
-# reserve (201), replay (201 + Idempotent-Replayed), reuse key with other seats (409)
-curl -i -XPOST $B/shows/$SHOW/reserve -H "authorization: Bearer $ALICE" -H 'content-type: application/json' \
-  -d '{"seats":["A2","A1"],"idempotency_key":"order-1"}'
-curl -i -XPOST $B/shows/$SHOW/reserve -H "authorization: Bearer $ALICE" -H 'content-type: application/json' \
-  -d '{"seats":["A1","A2"],"idempotency_key":"order-1"}'
-curl -i -XPOST $B/shows/$SHOW/reserve -H "authorization: Bearer $ALICE" -H 'content-type: application/json' \
-  -d '{"seats":["A3"],"idempotency_key":"order-1"}'
+res() { curl -s -w "  [HTTP %{http_code}]\n" -XPOST $B/shows/$SHOW/reserve \
+        -H "authorization: Bearer $1" -H 'content-type: application/json' -d "$2"; }
 
-curl -s $B/shows/$SHOW | jq '{total_seats, available, held, confirmed}'
-curl -s -XPOST $B/reservations/<reservation_id>/cancel -H "authorization: Bearer $ALICE"
-curl -s $B/metrics | grep reservations_
+OUT=$(res $ALICE '{"seats":["A1","A2"],"idempotency_key":"order-1"}'); echo "$OUT"   # 5  201
+RID=$(echo "$OUT" | sed 's/.*"reservation_id":"\([^"]*\)".*/\1/')
+res $ALICE '{"seats":["A2","A1"],"idempotency_key":"order-1"}'                   # 6  201 replay
+res $ALICE '{"seats":["A3"],"idempotency_key":"order-1"}'                        # 7  409 key reused
+res $BOB   '{"seats":["A1"],"idempotency_key":"order-1"}'                        # 8  409 seat taken
+res $BOB   '{"seats":["A3","A1"],"idempotency_key":"order-2"}'                   # 9  409 all-or-nothing
+res $ALICE '{"seats":["A3","A4","A5"],"idempotency_key":"order-2"}'              # 10 409 per-user limit
+
+curl -s $B/shows/$SHOW; echo                                                    # 11 show state
+curl -s $B/reservations/$RID -H "authorization: Bearer $ALICE"; echo            # 12 owner view
+curl -s -w "  [HTTP %{http_code}]\n" -XPOST $B/reservations/$RID/cancel -H "authorization: Bearer $BOB"    # 13 404
+curl -s -w "  [HTTP %{http_code}]\n" -XPOST $B/reservations/$RID/cancel -H "authorization: Bearer $ALICE"  # 14 200
+res $BOB '{"seats":["A1"],"idempotency_key":"order-3"}'                          # 15 201 resold
+curl -s -w "  [HTTP %{http_code}]\n" -XPOST $B/shows/$SHOW/reserve -H 'content-type: application/json' \
+  -d '{"seats":["A4"],"idempotency_key":"x"}'                                    # 16 401
+
+curl -s $B/metrics | grep '^reservations_'                                      # 17 metrics
+curl -s "$B/admin/logs?limit=5" -H "authorization: Bearer $ADMIN"               # 18 logs
+curl -s $B/admin/reconciliation -H "authorization: Bearer $ADMIN"; echo         # 19 integrity
 ```
+
+> **Repeating the walkthrough:** idempotency keys belong to a user and are remembered across
+> shows. If `alice` reuses `alice-order-1` on a new show, she correctly gets
+> `409 IDEMPOTENCY_KEY_REUSED`. Use fresh keys or fresh user names on each run (the script uses
+> `$RANDOM` for this).
 
 ## 16. Known limitations
 
