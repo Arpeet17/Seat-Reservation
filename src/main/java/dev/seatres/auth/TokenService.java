@@ -37,6 +37,10 @@ public class TokenService {
 
     public TokenService(AuthProperties props) {
         this.key = props.secret().getBytes(StandardCharsets.UTF_8);
+        if (props.secret().startsWith("local-dev-secret")) {
+            org.slf4j.LoggerFactory.getLogger(TokenService.class).warn(
+                    "AUTH_SECRET is the public local-dev default; tokens are forgeable. Set AUTH_SECRET for any shared deployment.");
+        }
     }
 
     public String issue(String userId, Principal.Role role, Duration ttl) {
