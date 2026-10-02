@@ -24,17 +24,26 @@ public class IndexController {
         return e;
     }
 
+    /** Insertion-ordered map so examples render with fields in a readable order. */
+    private static Map<String, Object> ordered(Object... kv) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        for (int i = 0; i < kv.length; i += 2) {
+            m.put((String) kv[i], kv[i + 1]);
+        }
+        return m;
+    }
+
     @GetMapping("/")
     public Map<String, Object> index() {
         List<Map<String, Object>> endpoints = List.of(
                 endpoint("POST", "/auth/dev-token", "none", "mint a demo token; include role admin for an admin token",
-                        Map.of("user_id", "alice")),
+                        ordered("user_id", "alice")),
                 endpoint("POST", "/shows", "admin", "create a show",
-                        Map.of("name", "friday-night", "seats", List.of("A1", "A2", "A3"), "price_paise", 25000,
+                        ordered("name", "friday-night", "seats", List.of("A1", "A2", "A3"), "price_paise", 25000,
                                 "per_user_limit", 4)),
                 endpoint("GET", "/shows/{showId}", "none", "show state, counts and per-seat status", null),
                 endpoint("POST", "/shows/{showId}/reserve", "user", "reserve seats (all or nothing)",
-                        Map.of("seats", List.of("A1"), "idempotency_key", "client-generated-key")),
+                        ordered("seats", List.of("A1"), "idempotency_key", "client-generated-key")),
                 endpoint("GET", "/reservations/{id}", "owner", "your reservation", null),
                 endpoint("POST", "/reservations/{id}/cancel", "owner", "cancel your reservation", null),
                 endpoint("GET", "/health/live", "none", "liveness", null),
