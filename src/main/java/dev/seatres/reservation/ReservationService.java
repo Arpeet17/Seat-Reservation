@@ -222,6 +222,14 @@ public class ReservationService {
      * an already-cancelled reservation is an idempotent 200.
      */
     public ReservationView cancel(Principal principal, UUID reservationId) {
+        // Lock-free fast path: CANCELLED is terminal, so a read that sees it can never be stale in
+        // a way that matters. Repeat cancels return without joining the row-lock queue.
+        ReservationRow seen = repo.findReservation(reservationId)
+                .filter(row -> row.userId().equals(principal.userId()))
+                .orElseThrow(ReservationService::reservationNotFound);
+        if ("CANCELLED".equals(seen.status())) {
+            return toView(seen, repo.seatLabelsOf(seen.id()));
+        }
         return withContentionRetry(() -> tx.execute(status -> {
             repo.setLocalTimeouts(lockTimeoutMs, statementTimeoutMs);
             ReservationRow r = repo.lockReservation(reservationId)

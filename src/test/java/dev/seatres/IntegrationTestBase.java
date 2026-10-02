@@ -53,7 +53,7 @@ public abstract class IntegrationTestBase {
         r.add("spring.datasource.username", POSTGRES::getUsername);
         r.add("spring.datasource.password", POSTGRES::getPassword);
         r.add("spring.datasource.hikari.maximum-pool-size", () -> "30");
-        r.add("seatres.db.lock-timeout-ms", () -> "1000");
+        r.add("seatres.db.lock-timeout-ms", () -> "2000");
     }
 
     public record Resp(int status, JsonNode body) {

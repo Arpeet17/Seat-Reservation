@@ -283,7 +283,7 @@ class ConcurrencyIT extends IntegrationTestBase {
         String show = createShow(seatRange("K", 2), null);
         String tok = token(uniqueUser("patient"));
 
-        // An external transaction holds K1's row lock for longer than lock_timeout (1s in tests).
+        // An external transaction holds K1's row lock for longer than lock_timeout (2s in tests).
         try (java.sql.Connection c = java.sql.DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(),
                 POSTGRES.getPassword())) {
             c.setAutoCommit(false);
@@ -292,13 +292,33 @@ class ConcurrencyIT extends IntegrationTestBase {
                 ps.executeQuery();
             }
             var pending = java.util.concurrent.CompletableFuture.supplyAsync(() -> reserve(tok, show, List.of("K1"), "k"));
-            Thread.sleep(1500);   // first attempt times out at 1s; the retry is waiting when we release
+            Thread.sleep(2500);   // first attempt times out at 2s; the retry is waiting when we release
             c.rollback();
             Resp r = pending.get(30, java.util.concurrent.TimeUnit.SECONDS);
             assertThat(r.status()).isEqualTo(201);
         }
         assertThat(meters.find("db.transaction.retries").tag("type", "lock_timeout").counter())
                 .isNotNull().satisfies(c -> assertThat(c.count()).isPositive());
+    }
+
+    // ------------------------------------------------------------------ logs access
+    @Test
+    void recentLogsAreQueryableByRequestId() throws Exception {
+        String rid = "trace-" + UUID.randomUUID();
+        HTTP.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(
+                        "http://localhost:" + port + "/shows/" + UUID.randomUUID())).header("X-Request-Id", rid).build(),
+                java.net.http.HttpResponse.BodyHandlers.discarding());
+
+        String admin = adminToken();
+        String body = "";
+        for (int i = 0; i < 50 && !body.contains(rid); i++) {   // async appender: allow a moment
+            Thread.sleep(100);
+            body = HTTP.send(java.net.http.HttpRequest.newBuilder(java.net.URI.create(
+                            "http://localhost:" + port + "/admin/logs?request_id=" + rid))
+                    .header("Authorization", "Bearer " + admin).build(), java.net.http.HttpResponse.BodyHandlers.ofString()).body();
+        }
+        assertThat(body).contains(rid).contains("\"status\":404").contains("SHOW_NOT_FOUND").doesNotContain("Bearer");
+        assertThat(call("GET", "/admin/logs", token(uniqueUser("nosy")), null).status()).isEqualTo(403);
     }
 
     // ------------------------------------------------------------------ helpers

@@ -23,10 +23,34 @@
         <neverBlock>true</neverBlock>
     </appender>
 
+    <!-- Bounded in-memory copy of recent lines, served by GET /admin/logs. -->
+    <appender name="RECENT" class="dev.seatres.observability.RecentLogsAppender">
+        <capacity>2000</capacity>
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <fieldNames>
+                <timestamp>timestamp</timestamp>
+                <version>[ignore]</version>
+                <levelValue>[ignore]</levelValue>
+            </fieldNames>
+            <includeMdcKeyName>request_id</includeMdcKeyName>
+            <includeMdcKeyName>user_id</includeMdcKeyName>
+            <includeMdcKeyName>show_id</includeMdcKeyName>
+            <includeMdcKeyName>reservation_id</includeMdcKeyName>
+        </encoder>
+    </appender>
+
+    <appender name="ASYNC_RECENT" class="ch.qos.logback.classic.AsyncAppender">
+        <appender-ref ref="RECENT"/>
+        <queueSize>8192</queueSize>
+        <discardingThreshold>0</discardingThreshold>
+        <neverBlock>true</neverBlock>
+    </appender>
+
     <logger name="com.zaxxer.hikari" level="WARN"/>
     <logger name="org.flywaydb" level="INFO"/>
 
     <root level="${LOG_LEVEL:-INFO}">
         <appender-ref ref="ASYNC"/>
+        <appender-ref ref="ASYNC_RECENT"/>
     </root>
 </configuration>
