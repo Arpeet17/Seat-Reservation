@@ -51,6 +51,8 @@ type result struct {
 	ownerID       string
 	resSeats      []string
 	err           error
+	retries       int
+	firstErr      error
 	latency       time.Duration
 }
 
@@ -228,8 +230,27 @@ func fire(showID string, jobs []job, tokens map[string]string) []result {
 func reserve(showID string, j job, token string) result {
 	body, _ := json.Marshal(map[string]any{"seats": j.seats, "idempotency_key": j.key})
 	start := time.Now()
-	resp, raw, err := do("POST", "/shows/"+showID+"/reserve", token, body)
-	r := result{job: j, latency: time.Since(start), err: err}
+	// A transport error means no HTTP response arrived. Retry with the SAME idempotency key, as a
+	// real client must: if the first attempt did reach the server, the retry is answered with the
+	// original outcome instead of a second reservation.
+	var resp *http.Response
+	var raw []byte
+	var err, firstErr error
+	retries := 0
+	for attempt := 1; attempt <= 3; attempt++ {
+		resp, raw, err = do("POST", "/shows/"+showID+"/reserve", token, body)
+		if err == nil {
+			break
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		if attempt < 3 {
+			retries++
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+	r := result{job: j, latency: time.Since(start), err: err, retries: retries, firstErr: firstErr}
 	if err != nil {
 		return r
 	}
@@ -250,8 +271,16 @@ func reserve(showID string, j job, token string) result {
 
 func report(rs []result, showID, admin string, mBefore, mAfter map[string]float64, mErr error) bool {
 	var confirmed, replay, seatTaken, perUser, idemConflict, other4xx, total4xx, total5xx, transport int
+	retried := 0
+	var netErrs []string
 	var lat []time.Duration
 	for _, r := range rs {
+		if r.retries > 0 {
+			retried++
+			if len(netErrs) < 3 {
+				netErrs = append(netErrs, r.firstErr.Error())
+			}
+		}
 		switch {
 		case r.err != nil:
 			transport++
@@ -296,6 +325,10 @@ func report(rs []result, showID, admin string, mBefore, mAfter map[string]float6
 	fmt.Printf("4xx_total:                 %d\n", total4xx)
 	fmt.Printf("5xx_total:                 %d\n", total5xx)
 	fmt.Printf("transport errors:          %d\n", transport)
+	fmt.Printf("network retries (same key): %d\n", retried)
+	for _, e := range netErrs {
+		fmt.Printf("  first error: %s\n", e)
+	}
 	fmt.Printf("latency p50/p95/p99/max:   %s / %s / %s / %s\n\n", pct(0.50), pct(0.95), pct(0.99), pct(1))
 
 	pass := true
