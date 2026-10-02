@@ -64,6 +64,7 @@ var (
 	limit       = flag.Int("limit", 4, "per-user limit for the created show")
 	seed        = flag.Int64("seed", time.Now().UnixNano(), "random seed")
 	timeout     = flag.Duration("timeout", 60*time.Second, "per-request timeout")
+	gaugeWait   = flag.Duration("gauge-wait", 4*time.Second, "wait after the burst before scraping /metrics again")
 )
 
 var client *http.Client
@@ -162,10 +163,18 @@ func main() {
 
 	// ---- fire ---------------------------------------------------------------------------
 	fmt.Printf("Firing %d requests (%d hot-seat storm on %d seats)...\n\n", len(jobs), hotCount, len(hot))
+	before, beforeErr := scrapeMetrics()
 	results := fire(showID, jobs, tokens)
 
+	// Let the per-show seat gauge refresh (every 2s on the server) before the second scrape.
+	time.Sleep(*gaugeWait)
+	after, afterErr := scrapeMetrics()
+	if beforeErr != nil {
+		afterErr = beforeErr
+	}
+
 	// ---- report -------------------------------------------------------------------------
-	ok := report(results, showID, admin)
+	ok := report(results, showID, admin, before, after, afterErr)
 	if !ok {
 		os.Exit(1)
 	}
@@ -239,7 +248,7 @@ func reserve(showID string, j job, token string) result {
 
 // ------------------------------------------------------------------------------- verification
 
-func report(rs []result, showID, admin string) bool {
+func report(rs []result, showID, admin string, mBefore, mAfter map[string]float64, mErr error) bool {
 	var confirmed, replay, seatTaken, perUser, idemConflict, other4xx, total4xx, total5xx, transport int
 	var lat []time.Duration
 	for _, r := range rs {
@@ -400,7 +409,97 @@ func report(rs []result, showID, admin string) bool {
 	} else {
 		check("DB RECONCILIATION", false, fmt.Sprintf("(could not run: %v)", err))
 	}
+
+	// METRICS: counter deltas across the burst must equal what this client observed, and the
+	// per-show seat gauge must equal the API's view of the show.
+	fmt.Println("\n=== Metrics reconciliation (/metrics vs this client vs API) ===")
+	if mErr != nil {
+		check("METRICS RECONCILE", false, fmt.Sprintf("(could not scrape /metrics: %v)", mErr))
+		return pass
+	}
+	delta := func(name string, labels ...string) int {
+		return int(sumMetric(mAfter, name, labels...) - sumMetric(mBefore, name, labels...))
+	}
+	gauge := func(status string) int {
+		return int(sumMetric(mAfter, "show_seats", `show_id="`+showID+`"`, `status="`+status+`"`))
+	}
+	type row struct {
+		label       string
+		expected    int
+		fromMetrics int
+	}
+	rows := []row{
+		{"reservations_confirmed_total            (delta vs 201 new)", confirmed, delta("reservations_confirmed_total")},
+		{"reservations_declined_total{seat_taken}           (delta)", seatTaken, delta("reservations_declined_total", `reason="seat_taken"`)},
+		{"reservations_declined_total{per_user_limit}       (delta)", perUser, delta("reservations_declined_total", `reason="per_user_limit"`)},
+		{"reservations_declined_total{idempotent_replay}    (delta)", replay, delta("reservations_declined_total", `reason="idempotent_replay"`)},
+		{"reservations_declined_total{idempotency_conflict} (delta)", idemConflict, delta("reservations_declined_total", `reason="idempotency_conflict"`)},
+		{"reservation_errors_total                (delta vs 5xx)", total5xx, delta("reservation_errors_total")},
+		{"show_seats{status=available}     (gauge vs GET /shows)", show.Available, gauge("available")},
+		{"show_seats{status=held}          (gauge vs GET /shows)", show.Held, gauge("held")},
+		{"show_seats{status=confirmed}     (gauge vs GET /shows)", show.Confirmed, gauge("confirmed")},
+	}
+	mismatches := 0
+	fmt.Printf("%-58s %10s %10s\n", "metric", "expected", "/metrics")
+	for _, r := range rows {
+		mark := "ok"
+		if r.expected != r.fromMetrics {
+			mark = "MISMATCH"
+			mismatches++
+		}
+		fmt.Printf("%-58s %10d %10d  %s\n", r.label, r.expected, r.fromMetrics, mark)
+	}
+	fmt.Println()
+	check("METRICS RECONCILE", mismatches == 0,
+		fmt.Sprintf("(%d mismatches; exact only if no other traffic hit the service during the run)", mismatches))
 	return pass
+}
+
+// scrapeMetrics fetches /metrics and returns series -> value, keyed by the full "name{labels}".
+func scrapeMetrics() (map[string]float64, error) {
+	resp, raw, err := do("GET", "/metrics", "", nil)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+	}
+	out := map[string]float64{}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		i := strings.LastIndex(line, " ")
+		if i < 0 {
+			continue
+		}
+		var v float64
+		if _, err := fmt.Sscanf(line[i+1:], "%g", &v); err == nil {
+			out[line[:i]] = v
+		}
+	}
+	return out, nil
+}
+
+// sumMetric sums every series of the given metric name whose labels contain all the given fragments.
+func sumMetric(m map[string]float64, name string, labelFragments ...string) float64 {
+	total := 0.0
+	for series, v := range m {
+		if series != name && !strings.HasPrefix(series, name+"{") {
+			continue
+		}
+		match := true
+		for _, f := range labelFragments {
+			if !strings.Contains(series, f) {
+				match = false
+				break
+			}
+		}
+		if match {
+			total += v
+		}
+	}
+	return total
 }
 
 // ------------------------------------------------------------------------------- HTTP plumbing
