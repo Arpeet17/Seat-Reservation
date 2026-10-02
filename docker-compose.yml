@@ -1,0 +1,53 @@
+# One command from a clean checkout:   docker compose up --build
+# Burst test against the stack:         docker compose --profile burst run --rm burst
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: seatres
+      POSTGRES_USER: seatres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-seatres}
+    command: ["postgres", "-c", "max_connections=200"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U seatres -d seatres"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_URL: jdbc:postgresql://postgres:5432/seatres
+      DB_USER: seatres
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-seatres}
+      # Local-only default. Any real deployment must set its own AUTH_SECRET.
+      AUTH_SECRET: ${AUTH_SECRET:-local-dev-secret-change-me-0123456789abcdef}
+      AUTH_DEV_TOKEN_ENDPOINT: "true"
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+    ports:
+      - "${APP_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/health/ready >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 30s
+
+  burst:
+    profiles: ["burst"]
+    image: golang:1.23-alpine
+    working_dir: /src
+    volumes:
+      - ./burst:/src
+    depends_on:
+      app:
+        condition: service_healthy
+    entrypoint: ["go", "run", ".", "-base", "http://app:8080"]
+
+volumes:
+  pgdata:
