@@ -13,8 +13,8 @@ Design rationale and race analysis: **[WRITEUP.md](WRITEUP.md)**.
 
 | | |
 |---|---|
-| **Live service** | `https://<your-service>.onrender.com` *(fill in after deploy)* |
-| **One-command burst** | `./burst.sh https://<your-service>.onrender.com` (details in [section 13](#13-burst-testing)) |
+| **Live service** | https://seat-reservation-86o2.onrender.com |
+| **One-command burst** | `./burst.sh https://seat-reservation-86o2.onrender.com` (details in [section 13](#13-burst-testing)) |
 | **Metrics** | `GET /metrics` (Prometheus text, public) |
 | **Logs** | `GET /admin/logs?request_id=…` with an admin token (see [Metrics & logs access](#metrics--logs-access)) |
 | **Health** | `GET /health/live`, `GET /health/ready` |
@@ -233,7 +233,7 @@ Health and metrics probes are logged only on failure.
 Reviewers don't need platform access; everything is reachable over HTTP on the live URL.
 
 ```bash
-B=https://<your-service>.onrender.com
+B=https://seat-reservation-86o2.onrender.com
 ADMIN=$(curl -s -XPOST $B/auth/dev-token -H 'content-type: application/json' \
   -d '{"user_id":"reviewer","role":"admin"}' | jq -r .token)
 
@@ -257,7 +257,7 @@ The full log stream also goes to stdout as JSON, where the platform collects it 
 
 ```bash
 ./burst.sh http://localhost:8080                        # uses local Go, else the golang image
-./burst.sh https://<your-app>.onrender.com -concurrency 200
+./burst.sh https://seat-reservation-86o2.onrender.com -concurrency 200
 docker compose --profile burst run --rm burst           # inside the compose network
 ```
 
@@ -278,7 +278,7 @@ Flags: `-requests`, `-concurrency`, `-hot-seats`, `-hot-users`, `-limit`, `-seed
 2. Render → **New → Blueprint** → select the repo. `render.yaml` provisions Postgres, builds the
    Dockerfile, injects `DATABASE_URL`, generates `AUTH_SECRET`, and uses `/health/ready` as the
    health check.
-3. Run `./burst.sh https://<service>.onrender.com -concurrency 200`.
+3. Run `./burst.sh https://seat-reservation-86o2.onrender.com -concurrency 200`.
 
 Any Docker host works the same way: set `DATABASE_URL` (or `DB_URL`/`DB_USER`/`DB_PASSWORD`) and
 `AUTH_SECRET`. Free-tier instances sleep when idle; the burst tool waits up to 3 minutes for

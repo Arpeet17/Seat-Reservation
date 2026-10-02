@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Usage: ./burst.sh <BASE_URL> [extra flags]
 #   ./burst.sh http://localhost:8080
-#   ./burst.sh https://seat-reservation.onrender.com -requests 20000 -concurrency 300
+#   ./burst.sh https://seat-reservation-86o2.onrender.com -requests 20000 -concurrency 300
 # Flags: -requests N -concurrency N -hot-seats N -hot-users N -limit N -seed N -secret S
 # Uses a local Go toolchain if present, otherwise runs inside the golang Docker image.
 set -euo pipefail
