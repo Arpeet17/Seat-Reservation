@@ -4,10 +4,11 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Supplier;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -23,7 +24,9 @@ import org.springframework.transaction.support.TransactionTemplate;
 import dev.seatres.auth.Principal;
 import dev.seatres.error.ApiException;
 import dev.seatres.error.ErrorCode;
+import dev.seatres.observability.ReservationMetrics;
 import dev.seatres.reservation.ReservationRepository.IdempotencyRecord;
+import dev.seatres.reservation.ReservationRepository.Precheck;
 import dev.seatres.reservation.ReservationRepository.ReservationRow;
 import dev.seatres.reservation.ReservationRepository.SeatState;
 import dev.seatres.show.ShowRepository.ShowRow;
@@ -35,10 +38,9 @@ import dev.seatres.show.ShowService;
  * <p><b>Stage A — pre-check</b> (plain autocommit reads, no locks). Exists purely to keep the
  * losers of a hot-seat storm out of the lock queue. It may only <i>reject</i> or <i>replay</i>,
  * never grant: a rejection is correct as of the instant of the read, so it is linearizable.
- * Reads run seats → quota → idempotency key, in that order. If a seat or the quota already
- * reflects a committed reservation, that commit happened before the idempotency read began, so
- * if it was this key's original request the key is visible and we replay instead of falsely
- * rejecting a client retry.
+ * Seats, quota and idempotency key are read in a single statement, hence a single snapshot: if
+ * a seat or the quota reflects a committed reservation, that reservation's idempotency row is in
+ * the same snapshot, so a client retry is replayed rather than falsely rejected.
  *
  * <p><b>Stage B — the authoritative transaction</b> (READ COMMITTED). Lock order is global:
  * idempotency key → seats (ascending id) → user quota row → fresh inserts. See WRITEUP.md for the
@@ -59,22 +61,26 @@ public class ReservationService {
         }
     }
 
+    private static final int MAX_ATTEMPTS = 3;
+
     private final ReservationRepository repo;
     private final ShowService shows;
     private final TransactionTemplate tx;
     private final ObjectMapper json;
+    private final ReservationMetrics metrics;
     private final int lockTimeoutMs;
     private final int statementTimeoutMs;
     private final int maxSeatsPerRequest;
 
     public ReservationService(ReservationRepository repo, ShowService shows, PlatformTransactionManager txManager,
-                              ObjectMapper json,
+                              ObjectMapper json, ReservationMetrics metrics,
                               @Value("${seatres.db.lock-timeout-ms}") int lockTimeoutMs,
                               @Value("${seatres.db.statement-timeout-ms}") int statementTimeoutMs,
                               @Value("${seatres.limits.max-seats-per-request}") int maxSeatsPerRequest) {
         this.repo = repo;
         this.shows = shows;
         this.json = json;
+        this.metrics = metrics;
         this.lockTimeoutMs = lockTimeoutMs;
         this.statementTimeoutMs = statementTimeoutMs;
         this.maxSeatsPerRequest = maxSeatsPerRequest;
@@ -86,23 +92,56 @@ public class ReservationService {
         String userId = principal.userId();
         List<String> labels = normalise(requestedSeats);
         ShowRow show = shows.require(showId);
-        int n = labels.size();
         byte[] hash = RequestHasher.hash(showId, labels);
+        return withContentionRetry(() -> attemptReserve(userId, show, labels, hash, idemKey));
+    }
+
+    /**
+     * Retries an attempt whose transaction was rolled back by a transient lock failure
+     * (lock_timeout, deadlock, serialization). Safe by construction: the rollback discarded
+     * everything, including the idempotency claim, so a new attempt starts from a clean slate.
+     * Never retries OUTCOME_UNKNOWN (commit may have happened) or any domain outcome.
+     */
+    private <T> T withContentionRetry(Supplier<T> attempt) {
+        for (int i = 1; ; i++) {
+            try {
+                return attempt.get();
+            } catch (ApiException e) {
+                throw e;
+            } catch (RuntimeException e) {
+                String type = ReservationMetrics.dbFailureType(e);
+                boolean transientLock = "lock_timeout".equals(type) || "deadlock".equals(type) || "serialization".equals(type);
+                if (!transientLock || i >= MAX_ATTEMPTS) {
+                    throw e;
+                }
+                metrics.retried(type);
+                log.warn("transient {} on attempt {}, retrying", type, i);
+                try {
+                    Thread.sleep(ThreadLocalRandom.current().nextLong(10, 50) * i);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+            }
+        }
+    }
+
+    private ReserveResult attemptReserve(String userId, ShowRow show, List<String> labels, byte[] hash, String idemKey) {
+        UUID showId = show.id();
+        int n = labels.size();
 
         // ---------------- Stage A: non-authoritative pre-check (reject or replay only) ----------------
-        List<SeatState> snapshot = repo.readSeats(showId, labels);
-        if (snapshot.size() != n) {
+        Precheck pre = repo.precheck(showId, labels, userId, idemKey);
+        if (pre.prior().isPresent()) {
+            return replayOrConflict(pre.prior().get(), hash);
+        }
+        if (pre.seatsFound() != n) {
             throw new ApiException(ErrorCode.UNKNOWN_SEAT, "one or more seats do not exist in this show");
         }
-        int alreadyHeld = repo.readQuota(showId, userId);
-        Optional<IdempotencyRecord> prior = repo.readIdempotency(userId, idemKey);
-        if (prior.isPresent()) {
-            return replayOrConflict(prior.get(), hash);
-        }
-        if (n > show.perUserLimit() || alreadyHeld + n > show.perUserLimit()) {
+        if (n > show.perUserLimit() || pre.quotaUsed() + n > show.perUserLimit()) {
             throw perUserLimit(show);
         }
-        if (snapshot.stream().anyMatch(s -> !"AVAILABLE".equals(s.status()))) {
+        if (pre.seatsTaken() > 0) {
             throw seatUnavailable();
         }
 
@@ -183,7 +222,7 @@ public class ReservationService {
      * an already-cancelled reservation is an idempotent 200.
      */
     public ReservationView cancel(Principal principal, UUID reservationId) {
-        return tx.execute(status -> {
+        return withContentionRetry(() -> tx.execute(status -> {
             repo.setLocalTimeouts(lockTimeoutMs, statementTimeoutMs);
             ReservationRow r = repo.lockReservation(reservationId)
                     .filter(row -> row.userId().equals(principal.userId()))
@@ -209,7 +248,7 @@ public class ReservationService {
             repo.markCancelled(r.id(), now);
             return toView(new ReservationRow(r.id(), r.showId(), r.userId(), "CANCELLED", r.seatCount(),
                     r.amountPaise(), r.createdAt(), now), labels);
-        });
+        }));
     }
 
     public ReservationView get(Principal principal, UUID reservationId) {

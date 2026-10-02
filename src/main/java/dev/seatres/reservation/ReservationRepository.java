@@ -41,21 +41,45 @@ public class ReservationRepository {
 
     /** Bounds every lock wait and statement inside the current transaction. */
     public void setLocalTimeouts(int lockTimeoutMs, int statementTimeoutMs) {
-        jdbc.execute("SET LOCAL lock_timeout = '" + lockTimeoutMs + "ms'");
-        jdbc.execute("SET LOCAL statement_timeout = '" + statementTimeoutMs + "ms'");
+        // set_config(..., is_local = true) is SET LOCAL; one round trip for both settings.
+        jdbc.queryForList("SELECT set_config('lock_timeout', ?, true), set_config('statement_timeout', ?, true)",
+                lockTimeoutMs + "ms", statementTimeoutMs + "ms");
     }
 
     // ---------------------------------------------------------------- non-locking reads (pre-check)
 
-    public List<SeatState> readSeats(UUID showId, Collection<String> labels) {
-        return seatQuery("SELECT id, label, status, reservation_id FROM seats WHERE show_id = ? AND label = ANY(?) ORDER BY id",
-                showId, labels);
+    public record Precheck(int seatsFound, int seatsTaken, int quotaUsed, Optional<IdempotencyRecord> prior) {
     }
 
-    public int readQuota(UUID showId, String userId) {
-        List<Integer> r = jdbc.queryForList("SELECT seats_reserved FROM user_show_quota WHERE show_id = ? AND user_id = ?",
-                Integer.class, showId, userId);
-        return r.isEmpty() ? 0 : r.get(0);
+    /**
+     * Everything the pre-check needs in one round trip and, because it is one statement, one
+     * MVCC snapshot: if a seat is seen as taken by transaction X, then X committed before the
+     * snapshot, so X's idempotency row (written in the same transaction) is visible too.
+     */
+    public Precheck precheck(UUID showId, Collection<String> labels, String userId, String key) {
+        return jdbc.query(con -> {
+            PreparedStatement ps = con.prepareStatement(
+                    "WITH s AS (SELECT count(*) AS found, count(*) FILTER (WHERE status <> 'AVAILABLE') AS taken "
+                            + "           FROM seats WHERE show_id = ? AND label = ANY(?)) "
+                            + "SELECT s.found, s.taken, "
+                            + "       coalesce((SELECT seats_reserved FROM user_show_quota WHERE show_id = ? AND user_id = ?), 0) AS quota, "
+                            + "       i.request_hash, i.reservation_id, i.response_status, i.response_body::text AS body "
+                            + "FROM s LEFT JOIN idempotency_keys i ON i.user_id = ? AND i.idem_key = ?");
+            ps.setObject(1, showId);
+            ps.setArray(2, textArray(con, labels));
+            ps.setObject(3, showId);
+            ps.setString(4, userId);
+            ps.setString(5, userId);
+            ps.setString(6, key);
+            return ps;
+        }, rs -> {
+            rs.next();
+            byte[] hash = rs.getBytes("request_hash");
+            Optional<IdempotencyRecord> prior = hash == null ? Optional.empty()
+                    : Optional.of(new IdempotencyRecord(hash, rs.getObject("reservation_id", UUID.class),
+                    (Integer) rs.getObject("response_status"), rs.getString("body")));
+            return new Precheck(rs.getInt("found"), rs.getInt("taken"), rs.getInt("quota"), prior);
+        });
     }
 
     public Optional<IdempotencyRecord> readIdempotency(String userId, String key) {

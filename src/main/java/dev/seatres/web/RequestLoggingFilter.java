@@ -2,6 +2,7 @@ package dev.seatres.web;
 
 import java.io.IOException;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -38,6 +39,8 @@ public class RequestLoggingFilter extends OncePerRequestFilter {
     private static final Pattern SAFE_ID = Pattern.compile("[A-Za-z0-9._-]{1,64}");
 
     private final MeterRegistry registry;
+    private final ConcurrentHashMap<String, Counter> counters = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Timer> timers = new ConcurrentHashMap<>();
 
     public RequestLoggingFilter(MeterRegistry registry) {
         this.registry = registry;
@@ -73,12 +76,14 @@ public class RequestLoggingFilter extends OncePerRequestFilter {
     private void recordHttpMetrics(HttpServletRequest req, int status, long nanos) {
         Object pattern = req.getAttribute(HandlerMapping.BEST_MATCHING_PATTERN_ATTRIBUTE);
         String route = pattern != null ? pattern.toString() : "UNMATCHED";
+        String method = req.getMethod();
         String statusClass = (status / 100) + "xx";
-        Counter.builder("http.requests").tag("method", req.getMethod()).tag("route", route)
-                .tag("status", String.valueOf(status)).register(registry).increment();
-        Timer.builder("http.request.duration").tag("method", req.getMethod()).tag("route", route)
-                .tag("status_class", statusClass).publishPercentileHistogram().register(registry)
-                .record(nanos, TimeUnit.NANOSECONDS);
+        counters.computeIfAbsent(method + ' ' + route + ' ' + status, k -> Counter.builder("http.requests")
+                .tag("method", method).tag("route", route).tag("status", String.valueOf(status))
+                .register(registry)).increment();
+        timers.computeIfAbsent(method + ' ' + route + ' ' + statusClass, k -> Timer.builder("http.request.duration")
+                .tag("method", method).tag("route", route).tag("status_class", statusClass)
+                .publishPercentileHistogram().register(registry)).record(nanos, TimeUnit.NANOSECONDS);
     }
 
     private static boolean isQuietPath(String path) {

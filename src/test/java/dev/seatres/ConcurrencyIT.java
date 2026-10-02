@@ -17,6 +17,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 class ConcurrencyIT extends IntegrationTestBase {
 
+    @org.springframework.beans.factory.annotation.Autowired
+    io.micrometer.core.instrument.MeterRegistry meters;
+
     // ------------------------------------------------------------------ Test 1
     @Test
     void singleSeatRace_exactlyOneWinner() {
@@ -272,6 +275,30 @@ class ConcurrencyIT extends IntegrationTestBase {
         assertThat(reserve(tok, show, List.of("Z99"), "k").code()).isEqualTo("UNKNOWN_SEAT");
         assertThat(reserve(tok, show, List.of("J1", "J1"), "k").code()).isEqualTo("DUPLICATE_SEAT");
         assertThat(reserve(tok, show, List.of(), "k").status()).isEqualTo(400);
+    }
+
+    // ------------------------------------------------------------------ transient lock failures
+    @Test
+    void lockTimeoutIsRetriedInternallyNotSurfacedAs5xx() throws Exception {
+        String show = createShow(seatRange("K", 2), null);
+        String tok = token(uniqueUser("patient"));
+
+        // An external transaction holds K1's row lock for longer than lock_timeout (1s in tests).
+        try (java.sql.Connection c = java.sql.DriverManager.getConnection(POSTGRES.getJdbcUrl(), POSTGRES.getUsername(),
+                POSTGRES.getPassword())) {
+            c.setAutoCommit(false);
+            try (var ps = c.prepareStatement("SELECT 1 FROM seats WHERE show_id = ?::uuid AND label = 'K1' FOR UPDATE")) {
+                ps.setString(1, show);
+                ps.executeQuery();
+            }
+            var pending = java.util.concurrent.CompletableFuture.supplyAsync(() -> reserve(tok, show, List.of("K1"), "k"));
+            Thread.sleep(1500);   // first attempt times out at 1s; the retry is waiting when we release
+            c.rollback();
+            Resp r = pending.get(30, java.util.concurrent.TimeUnit.SECONDS);
+            assertThat(r.status()).isEqualTo(201);
+        }
+        assertThat(meters.find("db.transaction.retries").tag("type", "lock_timeout").counter())
+                .isNotNull().satisfies(c -> assertThat(c.count()).isPositive());
     }
 
     // ------------------------------------------------------------------ helpers
