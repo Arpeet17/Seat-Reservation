@@ -22,7 +22,16 @@ services:
         generateValue: true
       - key: AUTH_DEV_TOKEN_ENDPOINT
         value: "true"
+      # Threads ~= pool: a request that holds a thread (almost) never waits for a DB connection, so
+      # overload queues at the socket instead of timing out on the pool. On 0.1 CPU a slow answer
+      # beats a 503, hence the longer connection wait.
       - key: DB_POOL_SIZE
-        value: "15"
+        value: "20"
+      - key: DB_CONNECTION_TIMEOUT_MS
+        value: "30000"
+      # Free plan = 512 MB / 0.1 CPU. Explicit budget so the JVM never exceeds the container limit
+      # (heap 256 + metaspace <=128 + code cache 48 + 25 threads x 512k + direct 32 + JVM overhead).
       - key: JAVA_TOOL_OPTIONS
-        value: "-XX:MaxRAMPercentage=70 -XX:+ExitOnOutOfMemoryError -XX:TieredStopAtLevel=1 -Xss512k"
+        value: "-Xms128m -Xmx256m -Xss512k -XX:MaxMetaspaceSize=128m -XX:ReservedCodeCacheSize=48m -XX:MaxDirectMemorySize=32m -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -XX:+ExitOnOutOfMemoryError"
+      - key: TOMCAT_MAX_THREADS
+        value: "25"
