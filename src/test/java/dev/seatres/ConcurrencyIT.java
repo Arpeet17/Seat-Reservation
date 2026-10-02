@@ -271,7 +271,9 @@ class ConcurrencyIT extends IntegrationTestBase {
     void rootDescribesTheService() {
         Resp r = call("GET", "/", null, null);
         assertThat(r.status()).isEqualTo(200);
-        assertThat(r.body().path("endpoints").has("POST /shows/{showId}/reserve")).isTrue();
+        var reserve = java.util.stream.StreamSupport.stream(r.body().path("endpoints").spliterator(), false)
+                .filter(e -> e.path("path").asText().equals("/shows/{showId}/reserve")).findFirst().orElseThrow();
+        assertThat(reserve.path("example_body").path("seats").isArray()).isTrue();
     }
 
     @Test

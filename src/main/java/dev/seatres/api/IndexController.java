@@ -1,6 +1,7 @@
 package dev.seatres.api;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 import org.springframework.web.bind.annotation.GetMapping;
@@ -10,24 +11,42 @@ import org.springframework.web.bind.annotation.RestController;
 @RestController
 public class IndexController {
 
+    private static Map<String, Object> endpoint(String method, String path, String auth, String description,
+                                                Object exampleBody) {
+        Map<String, Object> e = new LinkedHashMap<>();
+        e.put("method", method);
+        e.put("path", path);
+        e.put("auth", auth);
+        e.put("description", description);
+        if (exampleBody != null) {
+            e.put("example_body", exampleBody);
+        }
+        return e;
+    }
+
     @GetMapping("/")
     public Map<String, Object> index() {
-        Map<String, Object> endpoints = new LinkedHashMap<>();
-        endpoints.put("POST /auth/dev-token", "mint a demo token: {\"user_id\":\"alice\"} or {\"user_id\":\"admin\",\"role\":\"admin\"}");
-        endpoints.put("POST /shows", "create a show (admin)");
-        endpoints.put("GET /shows/{showId}", "show state, counts and per-seat status");
-        endpoints.put("POST /shows/{showId}/reserve", "reserve seats: {\"seats\":[\"A1\"],\"idempotency_key\":\"...\"}");
-        endpoints.put("GET /reservations/{id}", "your reservation");
-        endpoints.put("POST /reservations/{id}/cancel", "cancel your reservation");
-        endpoints.put("GET /health/live", "liveness");
-        endpoints.put("GET /health/ready", "readiness (checks PostgreSQL)");
-        endpoints.put("GET /metrics", "Prometheus metrics");
-        endpoints.put("GET /admin/logs", "recent structured logs (admin)");
-        endpoints.put("GET /admin/reconciliation", "invariant checks against the database (admin)");
+        List<Map<String, Object>> endpoints = List.of(
+                endpoint("POST", "/auth/dev-token", "none", "mint a demo token; include role admin for an admin token",
+                        Map.of("user_id", "alice")),
+                endpoint("POST", "/shows", "admin", "create a show",
+                        Map.of("name", "friday-night", "seats", List.of("A1", "A2", "A3"), "price_paise", 25000,
+                                "per_user_limit", 4)),
+                endpoint("GET", "/shows/{showId}", "none", "show state, counts and per-seat status", null),
+                endpoint("POST", "/shows/{showId}/reserve", "user", "reserve seats (all or nothing)",
+                        Map.of("seats", List.of("A1"), "idempotency_key", "client-generated-key")),
+                endpoint("GET", "/reservations/{id}", "owner", "your reservation", null),
+                endpoint("POST", "/reservations/{id}/cancel", "owner", "cancel your reservation", null),
+                endpoint("GET", "/health/live", "none", "liveness", null),
+                endpoint("GET", "/health/ready", "none", "readiness (checks PostgreSQL)", null),
+                endpoint("GET", "/metrics", "none", "Prometheus metrics", null),
+                endpoint("GET", "/admin/logs", "admin", "recent structured logs (?request_id=, ?level=, ?q=, ?limit=)", null),
+                endpoint("GET", "/admin/reconciliation", "admin", "invariant checks against the database", null));
 
         Map<String, Object> body = new LinkedHashMap<>();
         body.put("service", "seat-reservation");
         body.put("docs", "https://github.com/Arpeet17/Seat-Reservation#readme");
+        body.put("auth_header", "Authorization: Bearer <token from /auth/dev-token>");
         body.put("endpoints", endpoints);
         return body;
     }
