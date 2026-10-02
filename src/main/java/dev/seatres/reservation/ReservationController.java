@@ -51,6 +51,12 @@ public class ReservationController {
         return builder.body(result.reservation());
     }
 
+    @PostMapping("/reservations/{reservationId}/cancel")
+    public ReservationView cancel(Principal principal, @PathVariable UUID reservationId) {
+        RequestContext.reservationId(reservationId);
+        return reservations.cancel(principal, reservationId);
+    }
+
     @GetMapping("/reservations/{reservationId}")
     public ReservationView get(Principal principal, @PathVariable UUID reservationId) {
         RequestContext.reservationId(reservationId);

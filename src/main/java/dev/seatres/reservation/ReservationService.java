@@ -172,6 +172,46 @@ public class ReservationService {
         }
     }
 
+    /**
+     * CONFIRMED → CANCELLED, and each owned seat CONFIRMED → AVAILABLE, in one transaction.
+     *
+     * Lock order: reservation row → its seats (ascending id) → user quota row. The reserve path
+     * never locks an existing reservation row, and both paths take seats in ascending id order and
+     * the quota row last, so the two paths cannot form a wait cycle.
+     *
+     * Non-owners get 404, not 403, so reservation ids cannot be probed for existence. Cancelling
+     * an already-cancelled reservation is an idempotent 200.
+     */
+    public ReservationView cancel(Principal principal, UUID reservationId) {
+        return tx.execute(status -> {
+            repo.setLocalTimeouts(lockTimeoutMs, statementTimeoutMs);
+            ReservationRow r = repo.lockReservation(reservationId)
+                    .filter(row -> row.userId().equals(principal.userId()))
+                    .orElseThrow(ReservationService::reservationNotFound);
+            List<String> labels = repo.seatLabelsOf(r.id());
+            if ("CANCELLED".equals(r.status())) {
+                return toView(r, labels);
+            }
+
+            repo.lockSeatsOwnedBy(r.id());
+            // WHERE reservation_id = :r — can only ever free seats this reservation still owns.
+            int released = repo.releaseSeats(r.id());
+            if (released != r.seatCount()) {
+                throw new IllegalStateException("reservation " + r.id() + " owns " + released
+                        + " seats, expected " + r.seatCount());
+            }
+            repo.deactivateReservationSeats(r.id());
+            if (repo.decrementQuota(r.showId(), r.userId(), r.seatCount()) != 1) {
+                throw new IllegalStateException("quota row missing for confirmed reservation " + r.id());
+            }
+            repo.refundPayment(r.id());
+            Instant now = Instant.now().truncatedTo(ChronoUnit.MICROS);
+            repo.markCancelled(r.id(), now);
+            return toView(new ReservationRow(r.id(), r.showId(), r.userId(), "CANCELLED", r.seatCount(),
+                    r.amountPaise(), r.createdAt(), now), labels);
+        });
+    }
+
     public ReservationView get(Principal principal, UUID reservationId) {
         ReservationRow r = repo.findReservation(reservationId)
                 .filter(row -> row.userId().equals(principal.userId()))
