@@ -268,6 +268,13 @@ class ConcurrencyIT extends IntegrationTestBase {
     }
 
     @Test
+    void rootDescribesTheService() {
+        Resp r = call("GET", "/", null, null);
+        assertThat(r.status()).isEqualTo(200);
+        assertThat(r.body().path("endpoints").has("POST /shows/{showId}/reserve")).isTrue();
+    }
+
+    @Test
     void unknownShowAndSeatAreClientErrors() {
         String show = createShow(seatRange("J", 2), null);
         String tok = token(uniqueUser("u"));
